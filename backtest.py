@@ -81,6 +81,9 @@ def fetch_all():
 
             closes = df["Close"].dropna()
 
+            # Strip timezone (yfinance returns Asia/Kolkata aware index)
+            closes.index = pd.to_datetime(closes.index).tz_localize(None)
+
             # Trim to START_DATE
             closes = closes[closes.index >= pd.Timestamp(START_DATE)]
 
