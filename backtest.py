@@ -172,14 +172,13 @@ def run_4signal(data: dict) -> pd.DataFrame:
     df["active_pos"] = df["signal"].shift(1)
     df = df.dropna(subset=["active_pos"])
 
-    def pick_return(row):
-        p = row["active_pos"]
-        if p == "MID":   return row["mid_ret"]
-        if p == "NIFTY": return row["nifty_ret"]
-        if p == "GOLD":  return row["gold_ret"]
-        return CASH_WEEKLY  # CASH earns liquid fund rate
-
-    df["strat_ret"] = df.apply(pick_return, axis=1)
+    df["strat_ret"] = np.select(
+        [df["active_pos"] == "MID",
+         df["active_pos"] == "NIFTY",
+         df["active_pos"] == "GOLD"],
+        [df["mid_ret"], df["nifty_ret"], df["gold_ret"]],
+        default=CASH_WEEKLY,
+    )
     return df
 
 
@@ -318,13 +317,27 @@ if not has_mid:
     st.warning("MID150BEES data unavailable — 4-Signal strategy will use NIFTY for all equity phases (no midcap allocation).")
 
 with st.spinner("Running backtests…"):
-    df4 = run_4signal(raw)
-    dfD = run_donchian(raw)
+    try:
+        df4 = run_4signal(raw)
+    except Exception as e:
+        st.error(f"4-Signal error: {e}")
+        st.exception(e)
+        st.stop()
+    try:
+        dfD = run_donchian(raw)
+    except Exception as e:
+        st.error(f"Donchian error: {e}")
+        st.exception(e)
+        st.stop()
 
 # Guard against empty strategy output
 for label, frame in [("4-Signal", df4), ("Donchian", dfD)]:
     if frame.empty or "strat_ret" not in frame.columns:
-        st.error(f"{label} strategy returned no data. Check fetch warnings above.")
+        st.error(f"{label} strategy returned no usable data.")
+        st.write(f"Shape: {frame.shape} | Columns: {list(frame.columns)}")
+        if not frame.empty:
+            st.write("Head:", frame.head(3))
+            st.write("Null counts:", frame.isnull().sum())
         st.stop()
 
 # Align on common period
