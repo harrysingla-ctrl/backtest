@@ -61,20 +61,34 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_all():
     results, errors = {}, []
-    for name, ticker in TICKERS.items():
+    for name, ticker_sym in TICKERS.items():
         try:
-            df = yf.download(
-                ticker, start=START_DATE, end=datetime.today().strftime("%Y-%m-%d"),
-                interval="1wk", progress=False, auto_adjust=True,
-            )
+            # ticker.history() is more reliable than yf.download() for NSE tickers
+            t  = yf.Ticker(ticker_sym)
+            df = t.history(period="max", interval="1wk", auto_adjust=True)
+
+            if df.empty:
+                # fallback: try daily then resample to weekly
+                df_daily = t.history(period="max", interval="1d", auto_adjust=True)
+                if df_daily.empty:
+                    errors.append(f"{name} ({ticker_sym}): no data returned — ticker may be delisted or unavailable")
+                    continue
+                df = df_daily["Close"].resample("W-FRI").last().to_frame(name="Close")
+
+            # Normalise columns
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
+
             closes = df["Close"].dropna()
+
+            # Trim to START_DATE
+            closes = closes[closes.index >= pd.Timestamp(START_DATE)]
+
             if len(closes) < SMA_PERIOD + 10:
-                errors.append(f"{name}: only {len(closes)} weeks — need more history")
+                errors.append(f"{name}: only {len(closes)} weeks after {START_DATE} — need >{SMA_PERIOD + 10}")
             else:
                 results[name] = closes
-                st.toast(f"✅ {name}: {len(closes)} weeks fetched")
+                st.toast(f"✅ {name}: {len(closes)} weeks fetched ({closes.index[0].date()} → {closes.index[-1].date()})")
         except Exception as exc:
             errors.append(f"{name}: {exc}")
     return results, errors
