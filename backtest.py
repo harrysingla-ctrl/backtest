@@ -91,7 +91,6 @@ def fetch_all():
                 errors.append(f"{name}: only {len(closes)} weeks after {START_DATE} — need >{SMA_PERIOD + 10}")
             else:
                 results[name] = closes
-                st.toast(f"✅ {name}: {len(closes)} weeks fetched ({closes.index[0].date()} → {closes.index[-1].date()})")
         except Exception as exc:
             errors.append(f"{name}: {exc}")
     return results, errors
@@ -301,6 +300,8 @@ st.markdown("""
 
 with st.spinner("Fetching full historical data from Yahoo Finance…"):
     raw, errors = fetch_all()
+    for name, closes in raw.items():
+        st.toast(f"✅ {name}: {len(closes)} weeks ({closes.index[0].date()} → {closes.index[-1].date()})")
 
 if errors:
     with st.expander("⚠️ Fetch warnings"):
