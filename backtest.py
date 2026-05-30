@@ -108,11 +108,16 @@ def run_4signal(data: dict) -> pd.DataFrame:
     Position in defensive: GOLD or CASH
     """
     nb   = data["NIFTYBEES"]
-    mid  = data["MID150BEES"]
     gold = data["GOLDBEES"]
+    _has_mid = "MID150BEES" in data
 
-    df = pd.concat([nb, mid, gold], axis=1, join="inner")
-    df.columns = ["nifty", "mid", "gold"]
+    if _has_mid:
+        df = pd.concat([nb, data["MID150BEES"], gold], axis=1, join="inner")
+        df.columns = ["nifty", "mid", "gold"]
+    else:
+        df = pd.concat([nb, gold], axis=1, join="inner")
+        df.columns = ["nifty", "gold"]
+        df["mid"] = df["nifty"]
     df = df.dropna()
 
     # Indicators — computed on data up to each row (no look-ahead)
@@ -314,6 +319,12 @@ if not has_mid:
 with st.spinner("Running backtests…"):
     df4 = run_4signal(raw)
     dfD = run_donchian(raw)
+
+# Guard against empty strategy output
+for label, frame in [("4-Signal", df4), ("Donchian", dfD)]:
+    if frame.empty or "strat_ret" not in frame.columns:
+        st.error(f"{label} strategy returned no data. Check fetch warnings above.")
+        st.stop()
 
 # Align on common period
 common_start = max(df4.index[0], dfD.index[0])
