@@ -31,6 +31,8 @@ SMA_FAST          = 13     # Enhanced dual-SMA fast period
 BUFFER            = 0.02
 ROC_PERIOD        = 26
 DONCHIAN_PERIOD   = 20
+DONCHIAN_FAST     = 13   # Asymmetric: fast entry channel
+DONCHIAN_SLOW     = 26   # Asymmetric: slow exit channel
 RISK_FREE_RATE    = 0.065   # 6.5% p.a. liquid fund
 BOND_RATE         = 0.08    # 8% p.a. synthetic gilt return (fallback)
 CASH_WEEKLY       = RISK_FREE_RATE / 52
@@ -511,6 +513,116 @@ def run_donchian_mid(data: dict) -> pd.DataFrame:
     return df
 
 
+# ── Strategy 5: Donchian Pro (All 3 improvements combined) ────────────────────
+def run_donchian_pro(data: dict) -> pd.DataFrame:
+    """
+    Donchian Pro — three combined improvements over the Donchian Hybrid:
+
+    Improvement 1 — Asymmetric channels:
+        Enter equity when EQ/Gold ratio breaks above 13w high (fast entry)
+        Enter gold   when EQ/Gold ratio breaks below 26w low  (slow exit)
+        Avoids missing equity rallies like 2012 and 2018.
+
+    Improvement 2 — Absolute NiftyBees override:
+        If NiftyBees makes a new 20w high → force EQUITY regardless of ratio.
+        Catches bull runs where gold is also rallying (ratio stays stuck).
+
+    Improvement 3 — Cash on conflict:
+        If ratio says GOLD (below 26w low) but NiftyBees is above its 13w high
+        → go to CASH (liquid fund). Avoids being in falling gold during
+        equity strength (2015 problem).
+
+    S2 (unchanged): MID150/NiftyBees 20w Donchian → MIDCAP or LARGECAP
+    """
+    nb   = data["NIFTYBEES"]
+    gold = data["GOLDBEES"]
+
+    df = pd.concat([nb.rename("nifty"), gold.rename("gold")], axis=1, join="inner").dropna()
+
+    if "MID150BEES" in data:
+        df = df.join(data["MID150BEES"].rename("mid"), how="left")
+    else:
+        df["mid"] = np.nan
+    df["mid_live"] = df["mid"].notna()
+    df["mid"] = df["mid"].fillna(df["nifty"])
+
+    # ── Channels (all use shift(1) → strictly prior bars, no look-ahead) ────
+    # S1: EQ/Gold asymmetric channel
+    df["eg_ratio"]   = df["nifty"] / df["gold"]
+    eg_sh            = df["eg_ratio"].shift(1)
+    df["eg_13w_high"]= eg_sh.rolling(DONCHIAN_FAST, min_periods=DONCHIAN_FAST).max()
+    df["eg_26w_low"] = eg_sh.rolling(DONCHIAN_SLOW, min_periods=DONCHIAN_SLOW).min()
+
+    # S1 override: absolute NiftyBees channel
+    nifty_sh            = df["nifty"].shift(1)
+    df["nifty_20w_high"]= nifty_sh.rolling(DONCHIAN_PERIOD, min_periods=DONCHIAN_PERIOD).max()
+    df["nifty_13w_high"]= nifty_sh.rolling(DONCHIAN_FAST,   min_periods=DONCHIAN_FAST).max()
+
+    # S2: MID/NIFTY 20w symmetric channel (unchanged)
+    df["mid_ratio"]    = df["mid"] / df["nifty"]
+    mid_sh             = df["mid_ratio"].shift(1)
+    df["mid_don_high"] = mid_sh.rolling(DONCHIAN_PERIOD, min_periods=DONCHIAN_PERIOD).max()
+    df["mid_don_low"]  = mid_sh.rolling(DONCHIAN_PERIOD, min_periods=DONCHIAN_PERIOD).min()
+
+    df = df.dropna(subset=[
+        "eg_13w_high", "eg_26w_low",
+        "nifty_20w_high", "nifty_13w_high",
+        "mid_don_high", "mid_don_low",
+    ]).copy()
+    if df.empty:
+        return df
+
+    # ── S1 regime signal ─────────────────────────────────────────────────────
+    eg   = df["eg_ratio"]
+    nif  = df["nifty"]
+
+    # Priority (applied bottom-up, higher priority overwrites lower):
+    # GOLD  → ratio below 26w low AND nifty NOT above 13w high
+    # CASH  → ratio below 26w low AND nifty above 13w high (conflict)
+    # EQUITY→ ratio above 13w high  OR  nifty above 20w high (absolute override)
+
+    gold_cond = (eg  < df["eg_26w_low"])   & ~(nif > df["nifty_13w_high"])
+    cash_cond = (eg  < df["eg_26w_low"])   &  (nif > df["nifty_13w_high"])
+    eq_cond   = (eg  > df["eg_13w_high"])  |  (nif > df["nifty_20w_high"])
+
+    s1_raw = pd.Series(np.nan, index=df.index, dtype=object)
+    s1_raw[gold_cond] = "GOLD"
+    s1_raw[cash_cond] = "CASH"
+    s1_raw[eq_cond]   = "EQUITY"   # highest priority — overwrites GOLD and CASH
+
+    s1 = s1_raw.ffill().fillna("EQUITY")
+
+    # ── S2 mid/large signal ──────────────────────────────────────────────────
+    s2_raw = pd.Series(np.nan, index=df.index, dtype=object)
+    s2_raw[df["mid_ratio"] > df["mid_don_high"]] = "MID"
+    s2_raw[df["mid_ratio"] < df["mid_don_low"]]  = "NIFTY"
+    s2_raw[~df["mid_live"]] = "NIFTY"
+    s2 = s2_raw.ffill().fillna("NIFTY")
+
+    # ── Combine ──────────────────────────────────────────────────────────────
+    df["signal"] = np.where(
+        s1 == "EQUITY", s2,
+        np.where(s1 == "CASH", "CASH", "GOLD")
+    )
+
+    # ── Returns ──────────────────────────────────────────────────────────────
+    df["nifty_ret"] = df["nifty"].pct_change()
+    df["mid_ret"]   = df["mid"].pct_change()
+    df["gold_ret"]  = df["gold"].pct_change()
+
+    df["active_pos"] = df["signal"].shift(1)
+    df = df.iloc[1:].copy()
+
+    df["strat_ret"] = np.select(
+        [df["active_pos"] == "MID",
+         df["active_pos"] == "NIFTY",
+         df["active_pos"] == "GOLD"],
+        [df["mid_ret"], df["nifty_ret"], df["gold_ret"]],
+        default=CASH_WEEKLY,
+    )
+    return df
+
+
 # ── Metrics ────────────────────────────────────────────────────────────────────
 def compute_metrics(ret: pd.Series, label: str) -> dict:
     r = ret.dropna()
@@ -613,9 +725,13 @@ with st.spinner("Running backtests…"):
         dfH = run_donchian_mid(raw)
     except Exception as e:
         st.error(f"Donchian Hybrid error: {e}"); st.exception(e); st.stop()
+    try:
+        dfP = run_donchian_pro(raw)
+    except Exception as e:
+        st.error(f"Donchian Pro error: {e}"); st.exception(e); st.stop()
 
 # Guard against empty strategy output
-for label, frame in [("4-Signal", df4), ("Donchian", dfD), ("Enhanced", dfE), ("Donchian Hybrid", dfH)]:
+for label, frame in [("4-Signal", df4), ("Donchian", dfD), ("Enhanced", dfE), ("Donchian Hybrid", dfH), ("Donchian Pro", dfP)]:
     if frame.empty or "strat_ret" not in frame.columns:
         st.error(f"{label} strategy returned no usable data.")
         st.write(f"Shape: {frame.shape} | Columns: {list(frame.columns)}")
@@ -624,12 +740,13 @@ for label, frame in [("4-Signal", df4), ("Donchian", dfD), ("Enhanced", dfE), ("
         st.stop()
 
 # Align on common period
-common_start = max(df4.index[0], dfD.index[0], dfE.index[0], dfH.index[0])
-common_end   = min(df4.index[-1], dfD.index[-1], dfE.index[-1], dfH.index[-1])
+common_start = max(df4.index[0], dfD.index[0], dfE.index[0], dfH.index[0], dfP.index[0])
+common_end   = min(df4.index[-1], dfD.index[-1], dfE.index[-1], dfH.index[-1], dfP.index[-1])
 df4 = df4[(df4.index >= common_start) & (df4.index <= common_end)]
 dfD = dfD[(dfD.index >= common_start) & (dfD.index <= common_end)]
 dfE = dfE[(dfE.index >= common_start) & (dfE.index <= common_end)]
 dfH = dfH[(dfH.index >= common_start) & (dfH.index <= common_end)]
+dfP = dfP[(dfP.index >= common_start) & (dfP.index <= common_end)]
 
 # Benchmarks
 nb_ret   = raw["NIFTYBEES"].pct_change().dropna()
@@ -641,6 +758,7 @@ m4   = compute_metrics(df4["strat_ret"], "4-Signal App")
 mD   = compute_metrics(dfD["strat_ret"], "Kiru Donchian")
 mE   = compute_metrics(dfE["strat_ret"], "Enhanced 5-Signal")
 mH   = compute_metrics(dfH["strat_ret"], "Donchian Hybrid")
+mP   = compute_metrics(dfP["strat_ret"], "Donchian Pro")
 mNB  = compute_metrics(nb_ret,           "Nifty B&H")
 mGLD = compute_metrics(gld_ret,          "Gold B&H")
 
@@ -658,7 +776,7 @@ st.markdown(f"""
 # ── Summary Table ──────────────────────────────────────────────────────────────
 st.markdown('<div class="section-title">📊 Summary Metrics</div>', unsafe_allow_html=True)
 
-all_metrics = [m4, mD, mE, mH, mNB, mGLD]
+all_metrics = [m4, mD, mE, mH, mP, mNB, mGLD]
 best_cagr   = max(m["cagr"] for m in all_metrics)
 best_dd     = max(m["max_dd"] for m in all_metrics)  # least negative = best
 best_sharpe = max(m["sharpe"] for m in all_metrics)
@@ -713,6 +831,7 @@ y4   = yearly_table(df4["strat_ret"])
 yD   = yearly_table(dfD["strat_ret"])
 yE   = yearly_table(dfE["strat_ret"])
 yH   = yearly_table(dfH["strat_ret"])
+yP   = yearly_table(dfP["strat_ret"])
 yNB  = yearly_table(nb_ret)
 yGLD = yearly_table(gld_ret)
 
@@ -721,6 +840,7 @@ yearly_df = pd.DataFrame({
     "Kiru Donchian":     yD,
     "Enhanced 5-Signal": yE,
     "Donchian Hybrid":   yH,
+    "Donchian Pro":      yP,
     "Nifty B&H":         yNB,
     "Gold B&H":          yGLD,
 }).dropna(how="all")
@@ -744,6 +864,7 @@ eq_df = pd.DataFrame({
     "Kiru Donchian":     mD["equity"],
     "Enhanced 5-Signal": mE["equity"],
     "Donchian Hybrid":   mH["equity"],
+    "Donchian Pro":      mP["equity"],
     "Nifty B&H":         mNB["equity"],
     "Gold B&H":          mGLD["equity"],
 }).dropna()
@@ -773,8 +894,9 @@ pos4_counts = df4["active_pos"].value_counts(normalize=True).mul(100).round(1)
 posD_counts = dfD["active_pos"].value_counts(normalize=True).mul(100).round(1)
 posE_counts = dfE["active_pos"].value_counts(normalize=True).mul(100).round(1)
 posH_counts = dfH["active_pos"].value_counts(normalize=True).mul(100).round(1)
+posP_counts = dfP["active_pos"].value_counts(normalize=True).mul(100).round(1)
 
-pc1, pc2, pc3, pc4 = st.columns(4)
+pc1, pc2, pc3, pc4, pc5 = st.columns(5)
 asset_colors = {"MID": "#FF8C00", "NIFTY": "#1E90FF", "GOLD": "#DAA520",
                 "GILT": "#9B59B6", "CASH": "#3CB371"}
 
@@ -806,17 +928,21 @@ with pc3:
 with pc4:
     st.markdown("**Donchian Hybrid**")
     pos_bars(posH_counts)
+with pc5:
+    st.markdown("**Donchian Pro**")
+    pos_bars(posP_counts)
 
 # Number of switches
 n_switches_4 = (df4["signal"] != df4["signal"].shift(1)).sum()
 n_switches_D = (dfD["signal"] != dfD["signal"].shift(1)).sum()
 n_switches_E = (dfE["signal"] != dfE["signal"].shift(1)).sum()
 n_switches_H = (dfH["signal"] != dfH["signal"].shift(1)).sum()
+n_switches_P = (dfP["signal"] != dfP["signal"].shift(1)).sum()
 
 st.markdown(f"""
 <div style="font-size:13px;color:#666;font-family:'Space Mono',monospace;margin-top:8px">
   Switches — 4-Signal: {n_switches_4} &nbsp;|&nbsp; Donchian: {n_switches_D}
-  &nbsp;|&nbsp; Enhanced: {n_switches_E} &nbsp;|&nbsp; Hybrid: {n_switches_H}
+  &nbsp;|&nbsp; Enhanced: {n_switches_E} &nbsp;|&nbsp; Hybrid: {n_switches_H} &nbsp;|&nbsp; Pro: {n_switches_P}
   &nbsp;&nbsp;(fewer = lower transaction cost)
 </div>
 """, unsafe_allow_html=True)
