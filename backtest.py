@@ -431,7 +431,7 @@ def style_pct(val):
     prefix = "+" if val >= 0 else ""
     return f"color: {color}; font-weight: 600"
 
-styled = yearly_df.style.applymap(style_pct).format(lambda x: f"+{x*100:.1f}%" if x >= 0 else f"{x*100:.1f}%", na_rep="-")
+styled = yearly_df.style.map(style_pct).format(lambda x: f"+{x*100:.1f}%" if x >= 0 else f"{x*100:.1f}%", na_rep="-")
 st.dataframe(styled, use_container_width=True)
 
 
