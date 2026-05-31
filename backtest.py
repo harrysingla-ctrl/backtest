@@ -99,78 +99,66 @@ def fetch_all():
 # ── Strategy 1: 4-Signal App ───────────────────────────────────────────────────
 def run_4signal(data: dict) -> pd.DataFrame:
     """
-    S1: NiftyBees vs 26w SMA ± 2% buffer → Equity / Defensive / Hold
-    S2: MID150/Nifty ratio vs 26w SMA    → Midcap / Largecap
-    S3: GoldBees vs 26w SMA              → Gold uptrend
-    S4: NiftyBees/GoldBees 26w ROC < -5% → Gold outrunning equity
-    Position in equity: MIDCAP or NIFTY
-    Position in defensive: GOLD or CASH
+    Fully vectorised. No iterrows.
+    S1: NiftyBees vs 26w SMA ±2% buffer → Equity / Defensive / Buffer(hold)
+    S2: MID150/Nifty ratio vs 26w SMA   → MID / NIFTY
+    S3: GoldBees vs 26w SMA             → gold uptrend
+    S4: EQ/Gold 26w ROC < -5%          → gold outrunning equity
+    Buffer zone → forward-fill previous signal.
     """
     nb   = data["NIFTYBEES"]
     gold = data["GOLDBEES"]
-    _has_mid = "MID150BEES" in data
 
-    if _has_mid:
-        df = pd.concat([nb, data["MID150BEES"], gold], axis=1, join="inner")
-        df.columns = ["nifty", "mid", "gold"]
-    else:
-        df = pd.concat([nb, gold], axis=1, join="inner")
-        df.columns = ["nifty", "gold"]
-        df["mid"] = df["nifty"]
-    df = df.dropna()
+    frames = {"nifty": nb, "gold": gold}
+    if "MID150BEES" in data:
+        frames["mid"] = data["MID150BEES"]
+    df = pd.DataFrame(frames)
+    df = df[df.index.notna()].copy()
+    if "mid" not in df.columns:
+        df["mid"] = df["nifty"]  # fallback
 
-    # Indicators — computed on data up to each row (no look-ahead)
-    df["nifty_sma"]     = df["nifty"].rolling(SMA_PERIOD).mean()
-    ratio_mid           = df["mid"] / df["nifty"]
-    df["ratio_mid"]     = ratio_mid
-    df["ratio_mid_sma"] = ratio_mid.rolling(SMA_PERIOD).mean()
-    df["gold_sma"]      = df["gold"].rolling(SMA_PERIOD).mean()
-    eg_ratio            = df["nifty"] / df["gold"]
-    df["eg_roc"]        = eg_ratio.pct_change(ROC_PERIOD) * 100
+    # ── Indicators ──────────────────────────────────────────────────────────
+    df["nifty_sma"]     = df["nifty"].rolling(SMA_PERIOD, min_periods=SMA_PERIOD).mean()
+    df["ratio_mid"]     = df["mid"] / df["nifty"]
+    df["ratio_mid_sma"] = df["ratio_mid"].rolling(SMA_PERIOD, min_periods=SMA_PERIOD).mean()
+    df["gold_sma"]      = df["gold"].rolling(SMA_PERIOD, min_periods=SMA_PERIOD).mean()
+    eg                  = df["nifty"] / df["gold"]
+    df["eg_roc"]        = eg.pct_change(ROC_PERIOD)        # fraction, not %
 
-    # Signal generation — at end of each week
-    signals = []
-    last_signal = "CASH"
+    # Drop warmup rows (first SMA_PERIOD + ROC_PERIOD weeks)
+    df = df.dropna(subset=["nifty_sma", "ratio_mid_sma", "gold_sma", "eg_roc"]).copy()
+    if df.empty:
+        return df
 
-    for _, row in df.iterrows():
-        if any(pd.isna(row[c]) for c in ["nifty_sma", "ratio_mid_sma", "gold_sma", "eg_roc"]):
-            signals.append(None)
-            continue
+    # ── Signals (vectorised) ─────────────────────────────────────────────────
+    upper = df["nifty_sma"] * (1.0 + BUFFER)
+    lower = df["nifty_sma"] * (1.0 - BUFFER)
 
-        upper = row["nifty_sma"] * (1 + BUFFER)
-        lower = row["nifty_sma"] * (1 - BUFFER)
+    eq_regime  = df["nifty"] > upper
+    def_regime = df["nifty"] < lower
+    buf_regime = ~eq_regime & ~def_regime
 
-        if row["nifty"] > upper:
-            s1 = "EQUITY"
-        elif row["nifty"] < lower:
-            s1 = "DEFENSIVE"
-        else:
-            s1 = "BUFFER"  # hold current
+    s2_mid = df["ratio_mid"] > df["ratio_mid_sma"]
+    s3     = df["gold"] > df["gold_sma"]
+    s4     = df["eg_roc"] < -0.05   # -5% as fraction
 
-        if s1 == "EQUITY":
-            sig = "MID" if row["ratio_mid"] > row["ratio_mid_sma"] else "NIFTY"
-        elif s1 == "DEFENSIVE":
-            s3 = row["gold"] > row["gold_sma"]
-            s4 = row["eg_roc"] < -5.0
-            sig = "GOLD" if (s3 and s4) else "CASH"
-        else:
-            sig = last_signal  # buffer zone → hold
+    raw = pd.Series(np.nan, index=df.index, dtype=object)
+    raw[eq_regime  &  s2_mid]          = "MID"
+    raw[eq_regime  & ~s2_mid]          = "NIFTY"
+    raw[def_regime &  s3 & s4]         = "GOLD"
+    raw[def_regime & ~(s3 & s4)]       = "CASH"
+    # buf_regime stays NaN → forward-filled below
 
-        last_signal = sig
-        signals.append(sig)
+    df["signal"] = raw.ffill().fillna("CASH")
 
-    df["signal"] = signals
-    df = df.dropna(subset=["signal"])
-
-    # Returns — IMPORTANT: signal at week t → return earned in week t+1
-    # Shift signals forward by 1 so position[t] drives return[t+1]
+    # ── Returns ──────────────────────────────────────────────────────────────
     df["nifty_ret"] = df["nifty"].pct_change()
     df["mid_ret"]   = df["mid"].pct_change()
     df["gold_ret"]  = df["gold"].pct_change()
 
-    # active_position[t] = signal[t-1] (what we hold during week t)
+    # Signal at t → return earned at t+1
     df["active_pos"] = df["signal"].shift(1)
-    df = df.dropna(subset=["active_pos"])
+    df = df.iloc[1:].copy()   # drop first row (no prior signal)
 
     df["strat_ret"] = np.select(
         [df["active_pos"] == "MID",
@@ -185,49 +173,39 @@ def run_4signal(data: dict) -> pd.DataFrame:
 # ── Strategy 2: Kiru's Donchian ─────────────────────────────────────────────────
 def run_donchian(data: dict) -> pd.DataFrame:
     """
-    Turtle Trading + Dual Momentum on NiftyBees/GoldBees ratio.
-    Apply 20-week Donchian Channel to the ratio.
-    Ratio breaks above 20w high → hold NiftyBees
-    Ratio breaks below 20w low  → hold GoldBees
-    Always invested (no cash).
+    Fully vectorised Donchian on NiftyBees/GoldBees ratio.
+    20-week channel uses shift(1) to avoid look-ahead.
+    Breakout above → NIFTY. Breakdown below → GOLD.
+    Always invested (no cash). Forward-fill between breakouts.
     """
     nb   = data["NIFTYBEES"]
     gold = data["GOLDBEES"]
 
-    df = pd.concat([nb, gold], axis=1, join="inner")
-    df.columns = ["nifty", "gold"]
-    df = df.dropna()
+    df = pd.DataFrame({"nifty": nb, "gold": gold})
+    df = df[df.index.notna()].copy()
 
     df["ratio"]    = df["nifty"] / df["gold"]
 
-    # Donchian using shift(1) on rolling max/min to avoid look-ahead:
-    # At end of week t, channel is based on weeks t-20 to t-1
-    df["don_high"] = df["ratio"].shift(1).rolling(DONCHIAN_PERIOD).max()
-    df["don_low"]  = df["ratio"].shift(1).rolling(DONCHIAN_PERIOD).min()
+    # Channel based on prior DONCHIAN_PERIOD bars (shift avoids look-ahead)
+    shifted        = df["ratio"].shift(1)
+    df["don_high"] = shifted.rolling(DONCHIAN_PERIOD, min_periods=DONCHIAN_PERIOD).max()
+    df["don_low"]  = shifted.rolling(DONCHIAN_PERIOD, min_periods=DONCHIAN_PERIOD).min()
 
-    signals = []
-    last_sig = "NIFTY"
+    df = df.dropna(subset=["don_high", "don_low"]).copy()
+    if df.empty:
+        return df
 
-    for _, row in df.iterrows():
-        if pd.isna(row["don_high"]) or pd.isna(row["don_low"]):
-            signals.append(None)
-            continue
-        if row["ratio"] > row["don_high"]:
-            last_sig = "NIFTY"
-        elif row["ratio"] < row["don_low"]:
-            last_sig = "GOLD"
-        # else: hold last signal
-        signals.append(last_sig)
-
-    df["signal"] = signals
-    df = df.dropna(subset=["signal"])
+    # Raw signal at breakout; NaN elsewhere → forward-fill → start default NIFTY
+    raw = pd.Series(np.nan, index=df.index, dtype=object)
+    raw[df["ratio"] > df["don_high"]] = "NIFTY"
+    raw[df["ratio"] < df["don_low"]]  = "GOLD"
+    df["signal"] = raw.ffill().fillna("NIFTY")
 
     df["nifty_ret"] = df["nifty"].pct_change()
     df["gold_ret"]  = df["gold"].pct_change()
 
-    # Same no-look-ahead rule: signal[t] → return[t+1]
     df["active_pos"] = df["signal"].shift(1)
-    df = df.dropna(subset=["active_pos"])
+    df = df.iloc[1:].copy()
 
     df["strat_ret"] = np.where(
         df["active_pos"] == "NIFTY",
