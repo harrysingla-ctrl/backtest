@@ -602,7 +602,7 @@ st.caption("🏆 Best CAGR &nbsp;·&nbsp; 🛡 Lowest drawdown &nbsp;·&nbsp; �
 # ── CAGR vs Drawdown Visual ────────────────────────────────────────────────────
 st.markdown('<div class="section-title">⚖️ Return vs Risk</div>', unsafe_allow_html=True)
 
-cols = st.columns(4)
+cols = st.columns(len(all_metrics))
 for i, m in enumerate(all_metrics):
     with cols[i]:
         cagr_clr = "#3CB371" if m["cagr"] > 0.20 else ("#E6A817" if m["cagr"] > 0.10 else "#E74C3C")
@@ -662,7 +662,7 @@ st.line_chart(eq_df, use_container_width=True)
 
 # Final corpus
 st.markdown('<div class="section-title">💰 Final Corpus</div>', unsafe_allow_html=True)
-fc_cols = st.columns(4)
+fc_cols = st.columns(len(all_metrics))
 for i, m in enumerate(all_metrics):
     final_val = m["equity"].iloc[-1]
     multiple  = final_val / INITIAL_CAPITAL
