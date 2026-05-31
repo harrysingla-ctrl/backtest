@@ -369,7 +369,8 @@ st.markdown("""
 with st.spinner("Fetching full historical data from Yahoo Finance…"):
     raw, errors = fetch_all()
     for name, closes in raw.items():
-        st.toast(f"✅ {name}: {len(closes)} weeks ({closes.index[0].date()} → {closes.index[-1].date()})")
+        if isinstance(closes, pd.Series):
+            st.toast(f"✅ {name}: {len(closes)} weeks ({closes.index[0].date()} → {closes.index[-1].date()})")
 
 if errors:
     with st.expander("⚠️ Fetch warnings"):
