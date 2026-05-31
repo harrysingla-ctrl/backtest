@@ -131,8 +131,15 @@ def run_4signal(data: dict) -> pd.DataFrame:
     eg                  = df["nifty"] / df["gold"]
     df["eg_roc"]        = eg.pct_change(ROC_PERIOD)        # fraction, not %
 
+    # Debug: show state before dropna
+    st.write("📍 Before warmup dropna — shape:", df.shape)
+    st.write("Null counts:", df[["nifty_sma","ratio_mid_sma","gold_sma","eg_roc"]].isnull().sum().to_dict())
+    st.write("Sample index (first 3):", list(df.index[:3]))
+    st.write("Nifty sample:", df["nifty"].dropna().head(3).to_dict())
+
     # Drop warmup rows (first SMA_PERIOD + ROC_PERIOD weeks)
     df = df.dropna(subset=["nifty_sma", "ratio_mid_sma", "gold_sma", "eg_roc"]).copy()
+    st.write("📍 After warmup dropna — shape:", df.shape)
     if df.empty:
         return df
 
