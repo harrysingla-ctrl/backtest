@@ -58,6 +58,74 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
 
 # ── Data ───────────────────────────────────────────────────────────────────────
+# ── Midcap Index Splice ────────────────────────────────────────────────────────
+MID_INDEX_TICKERS = [
+    "^NIFMDCP150",    # Nifty Midcap 150 (preferred)
+    "^NSMIDCP150",    # alternate symbol
+    "NIFTYMIDCAP150.NS",
+    "^NSMIDCP100",    # Nifty Midcap 100 (fallback)
+    "^NIFMDCP100",
+]
+
+def _fetch_single_weekly(ticker_sym: str):
+    """Fetch one ticker, return tz-naive Friday-resampled weekly Close or None."""
+    try:
+        t  = yf.Ticker(ticker_sym)
+        df = t.history(period="max", interval="1wk", auto_adjust=True)
+        if df.empty:
+            df_d = t.history(period="max", interval="1d", auto_adjust=True)
+            if df_d.empty:
+                return None
+            df = df_d["Close"].resample("W-FRI").last().to_frame("Close")
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        s = df["Close"].dropna()
+        idx = s.index
+        if hasattr(idx, "tz") and idx.tz is not None:
+            idx = idx.tz_convert(None)
+        s.index = pd.DatetimeIndex(idx).normalize()
+        s = s[~s.index.duplicated(keep="last")]
+        s = s.resample("W-FRI").last().dropna()
+        return s if len(s) >= 10 else None
+    except Exception:
+        return None
+
+def build_spliced_mid(etf_series: pd.Series, toast_fn=None) -> tuple[pd.Series, str]:
+    """
+    Extend MID150BEES back in time using a Nifty Midcap index.
+    Returns (spliced_series, note_string).
+    Scale factor = median(ETF / index) over overlap → synthetic pre-ETF prices.
+    """
+    idx_data, idx_name = None, None
+    for sym in MID_INDEX_TICKERS:
+        data = _fetch_single_weekly(sym)
+        if data is not None and len(data) > 52:
+            idx_data, idx_name = data, sym
+            break
+
+    if idx_data is None:
+        return etf_series, "No index proxy found — MID150BEES used as-is"
+
+    # Overlap period (need ≥ 8 weeks for reliable scale factor)
+    overlap = etf_series.index.intersection(idx_data.index)
+    if len(overlap) < 8:
+        return etf_series, f"{idx_name} found but overlap too short — MID150BEES used as-is"
+
+    # Scale factor: median ratio ETF / index over overlap
+    scale   = (etf_series[overlap] / idx_data[overlap]).median()
+
+    # Synthetic prices for dates before ETF launch
+    etf_start   = etf_series.index[0]
+    pre_idx     = idx_data[idx_data.index < etf_start] * scale
+    spliced     = pd.concat([pre_idx, etf_series]).sort_index()
+    spliced     = spliced[~spliced.index.duplicated(keep="last")]
+
+    n_synthetic = len(pre_idx)
+    note = (f"Extended using **{idx_name}** — scale factor {scale:.4f} "
+            f"({n_synthetic} synthetic weeks prepended before {etf_start.date()})")
+    return spliced, note
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_all():
     results, errors = {}, []
@@ -97,10 +165,20 @@ def fetch_all():
             closes = closes[closes.index >= pd.Timestamp(START_DATE)]
             closes = closes.dropna()
 
-            if len(closes) < SMA_PERIOD + 10:
-                errors.append(f"{name}: only {len(closes)} weeks after {START_DATE} — need >{SMA_PERIOD + 10}")
+            # Base tickers need full history; MID150BEES accepted even if shorter
+            min_len = SMA_PERIOD + 10 if name in ("NIFTYBEES", "GOLDBEES") else 4
+            if len(closes) < min_len:
+                errors.append(f"{name}: only {len(closes)} weeks — insufficient")
             else:
                 results[name] = closes
+
+    # ── Splice MID150BEES back in time using midcap index ───────────────────────
+    if "MID150BEES" in results:
+        spliced, splice_note = build_spliced_mid(results["MID150BEES"])
+        results["MID150BEES"] = spliced
+        results["_splice_note"] = splice_note  # pass note to UI
+    else:
+        results["_splice_note"] = "MID150BEES not fetched — using NIFTY for equity regime"
         except Exception as exc:
             errors.append(f"{name}: {exc}")
     return results, errors
@@ -119,16 +197,15 @@ def run_4signal(data: dict) -> pd.DataFrame:
     nb   = data["NIFTYBEES"]
     gold = data["GOLDBEES"]
 
-    # Inner join so only dates where ALL tickers have data are kept
+    # Base: inner join nifty+gold (full history from 2010)
+    # Mid: left-joined so pre-2019 rows keep NaN → fallback to NIFTY
+    df = pd.concat([nb.rename("nifty"), gold.rename("gold")], axis=1, join="inner").dropna()
     if "MID150BEES" in data:
-        df = pd.concat(
-            [nb.rename("nifty"), data["MID150BEES"].rename("mid"), gold.rename("gold")],
-            axis=1, join="inner",
-        )
+        df = df.join(data["MID150BEES"].rename("mid"), how="left")
     else:
-        df = pd.concat([nb.rename("nifty"), gold.rename("gold")], axis=1, join="inner")
-        df["mid"] = df["nifty"]   # fallback: no midcap allocation
-    df = df.dropna()
+        df["mid"] = np.nan
+    df["mid_live"] = df["mid"].notna()          # True only where ETF exists
+    df["mid"] = df["mid"].fillna(df["nifty"])   # pre-2019: mid = nifty (no MID signal)
 
     # ── Indicators ──────────────────────────────────────────────────────────
     df["nifty_sma"]     = df["nifty"].rolling(SMA_PERIOD, min_periods=SMA_PERIOD).mean()
@@ -156,10 +233,10 @@ def run_4signal(data: dict) -> pd.DataFrame:
     s4     = df["eg_roc"] < -0.05   # -5% as fraction
 
     raw = pd.Series(np.nan, index=df.index, dtype=object)
-    raw[eq_regime  &  s2_mid]          = "MID"
-    raw[eq_regime  & ~s2_mid]          = "NIFTY"
-    raw[def_regime &  s3 & s4]         = "GOLD"
-    raw[def_regime & ~(s3 & s4)]       = "CASH"
+    raw[eq_regime  &  s2_mid & df["mid_live"]]  = "MID"   # MID only when ETF exists
+    raw[eq_regime  & (~s2_mid | ~df["mid_live"])] = "NIFTY" # else always largecap
+    raw[def_regime &  s3 & s4]                  = "GOLD"
+    raw[def_regime & ~(s3 & s4)]                = "CASH"
     # buf_regime stays NaN → forward-filled below
 
     df["signal"] = raw.ffill().fillna("CASH")
@@ -295,6 +372,11 @@ with st.spinner("Fetching full historical data from Yahoo Finance…"):
 if errors:
     with st.expander("⚠️ Fetch warnings"):
         for e in errors: st.warning(e)
+
+# Show splice info
+splice_note = raw.pop("_splice_note", None)
+if splice_note:
+    st.info(f"📊 Midcap proxy: {splice_note}")
 
 missing = [k for k in ["NIFTYBEES", "GOLDBEES"] if k not in raw]
 if missing:
