@@ -81,8 +81,14 @@ def fetch_all():
 
             closes = df["Close"].dropna()
 
-            # Strip timezone (yfinance returns Asia/Kolkata aware index)
-            closes.index = pd.to_datetime(closes.index).tz_localize(None)
+            # Strip timezone and normalise to midnight so all tickers align
+            idx = closes.index
+            if hasattr(idx, "tz") and idx.tz is not None:
+                idx = idx.tz_convert(None)   # remove tz properly
+            closes.index = pd.DatetimeIndex(idx).normalize()  # 00:00:00 for all
+
+            # Remove any duplicate dates (safety)
+            closes = closes[~closes.index.duplicated(keep="last")]
 
             # Trim to START_DATE
             closes = closes[closes.index >= pd.Timestamp(START_DATE)]
