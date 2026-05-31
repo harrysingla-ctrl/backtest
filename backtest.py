@@ -161,9 +161,9 @@ def build_spliced_mid(etf_series: pd.Series, toast_fn=None) -> tuple[pd.Series, 
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_all():
+def fetch_all(tickers_frozen: tuple):
     results, errors = {}, []
-    for name, ticker_sym in TICKERS.items():
+    for name, ticker_sym in dict(tickers_frozen).items():
         try:
             # ticker.history() is more reliable than yf.download() for NSE tickers
             t  = yf.Ticker(ticker_sym)
@@ -838,7 +838,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 with st.spinner("Fetching full historical data from Yahoo Finance…"):
-    raw, errors = fetch_all()
+    raw, errors = fetch_all(tuple(sorted(TICKERS.items())))
     for name, closes in raw.items():
         if isinstance(closes, pd.Series):
             st.toast(f"✅ {name}: {len(closes)} weeks ({closes.index[0].date()} → {closes.index[-1].date()})")
@@ -919,8 +919,10 @@ mE   = compute_metrics(dfE["strat_ret"], "Enhanced 5-Signal")
 mH   = compute_metrics(dfH["strat_ret"], "Donchian Hybrid")
 mP   = compute_metrics(dfP["strat_ret"],  "Donchian Pro")
 mP2  = compute_metrics(dfP2["strat_ret"], "Donchian Pro v2")
-mNB  = compute_metrics(nb_ret,           "Nifty B&H")
-mGLD = compute_metrics(gld_ret,          "Gold B&H")
+_eq_label   = "SPY B&H"   if IS_US else "Nifty B&H"
+_gold_label = "GLD B&H"   if IS_US else "Gold B&H"
+mNB  = compute_metrics(nb_ret,   _eq_label)
+mGLD = compute_metrics(gld_ret,  _gold_label)
 
 start_yr = pd.to_datetime(common_start).year
 end_yr   = pd.to_datetime(common_end).year
