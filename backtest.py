@@ -24,15 +24,19 @@ TICKERS = {
     "NIFTYBEES":  "NIFTYBEES.NS",
     "MID150BEES": "MID150BEES.NS",
     "GOLDBEES":   "GOLDBEES.NS",
+    "BONDBEES":   "GSEC10YBEES.NS",   # SBI ETF 10Y Gilt — S5 bond signal
 }
-SMA_PERIOD      = 26
-BUFFER          = 0.02
-ROC_PERIOD      = 26
-DONCHIAN_PERIOD = 20
-RISK_FREE_RATE  = 0.065   # 6.5% p.a. India liquid fund proxy
-CASH_WEEKLY     = RISK_FREE_RATE / 52
-START_DATE      = "2010-01-01"
-INITIAL_CAPITAL = 100_000  # ₹1 lakh
+SMA_PERIOD        = 26
+SMA_FAST          = 13     # Enhanced dual-SMA fast period
+BUFFER            = 0.02
+ROC_PERIOD        = 26
+DONCHIAN_PERIOD   = 20
+RISK_FREE_RATE    = 0.065   # 6.5% p.a. liquid fund
+BOND_RATE         = 0.08    # 8% p.a. synthetic gilt return (fallback)
+CASH_WEEKLY       = RISK_FREE_RATE / 52
+BOND_WEEKLY_SYNTH = BOND_RATE / 52
+START_DATE        = "2010-01-01"
+INITIAL_CAPITAL   = 100_000
 
 
 # ── Styles ─────────────────────────────────────────────────────────────────────
@@ -306,6 +310,126 @@ def run_donchian(data: dict) -> pd.DataFrame:
     return df
 
 
+# ── Strategy 3: Enhanced 5-Signal ──────────────────────────────────────────────
+def run_enhanced(data: dict) -> pd.DataFrame:
+    """
+    Enhanced 5-Signal Strategy — three upgrades over the 4-Signal App:
+
+    S1 (enhanced): Dual SMA confirmation — both 13w AND 26w must agree to
+                   switch regime. Eliminates premature entries/exits in
+                   range-bound markets like 2022.
+
+    S2 (enhanced): Midcap quality filter — ratio > 26w SMA AND 13w ROC > 0.
+                   Only allocates to midcap when momentum is genuinely
+                   accelerating, not just marginally above the SMA.
+
+    S3 / S4:       Unchanged from 4-Signal App.
+
+    S5 (new):      Gilt/bond rotation — when defensive and gold fails,
+                   check if a gilt ETF (GSEC10YBEES) is above its 13w SMA.
+                   If yes → GILT. If no → CASH.
+                   Falls back to synthetic 8% p.a. if ETF unavailable.
+    """
+    nb   = data["NIFTYBEES"]
+    gold = data["GOLDBEES"]
+    has_bond = "BONDBEES" in data
+    has_mid  = "MID150BEES" in data
+
+    # Base: inner join nifty + gold
+    df = pd.concat([nb.rename("nifty"), gold.rename("gold")], axis=1, join="inner").dropna()
+
+    # Left-join mid and bond (shorter histories)
+    if has_mid:
+        df = df.join(data["MID150BEES"].rename("mid"), how="left")
+    else:
+        df["mid"] = np.nan
+    df["mid_live"] = df["mid"].notna()
+    df["mid"] = df["mid"].fillna(df["nifty"])
+
+    if has_bond:
+        df = df.join(data["BONDBEES"].rename("bond"), how="left")
+    else:
+        df["bond"] = np.nan
+    df["bond_live"] = df["bond"].notna()
+
+    # ── Indicators ──────────────────────────────────────────────────────────
+    # S1 enhanced: dual SMA
+    df["nifty_sma26"] = df["nifty"].rolling(SMA_PERIOD, min_periods=SMA_PERIOD).mean()
+    df["nifty_sma13"] = df["nifty"].rolling(SMA_FAST,   min_periods=SMA_FAST).mean()
+
+    # S2 enhanced: ratio + momentum quality
+    df["ratio_mid"]     = df["mid"] / df["nifty"]
+    df["ratio_mid_sma"] = df["ratio_mid"].rolling(SMA_PERIOD, min_periods=SMA_PERIOD).mean()
+    df["ratio_roc13"]   = df["ratio_mid"].pct_change(SMA_FAST)   # 13w momentum
+
+    # S3 / S4 unchanged
+    df["gold_sma"] = df["gold"].rolling(SMA_PERIOD, min_periods=SMA_PERIOD).mean()
+    eg             = df["nifty"] / df["gold"]
+    df["eg_roc"]   = eg.pct_change(ROC_PERIOD)
+
+    # S5: gilt ETF vs 13w SMA
+    df["bond_sma13"] = df["bond"].rolling(SMA_FAST, min_periods=SMA_FAST).mean()
+
+    # Drop warmup
+    df = df.dropna(subset=[
+        "nifty_sma26", "nifty_sma13",
+        "ratio_mid_sma", "ratio_roc13",
+        "gold_sma", "eg_roc",
+    ]).copy()
+    if df.empty:
+        return df
+
+    # ── Signal generation (vectorised) ──────────────────────────────────────
+    upper = df["nifty_sma26"] * (1.0 + BUFFER)
+    lower = df["nifty_sma26"] * (1.0 - BUFFER)
+
+    # S1 enhanced: slow AND fast must agree
+    eq_regime  = (df["nifty"] > upper) & (df["nifty"] > df["nifty_sma13"])
+    def_regime = (df["nifty"] < lower) & (df["nifty"] < df["nifty_sma13"])
+
+    # S2 enhanced: ratio above SMA AND momentum positive
+    s2_mid = (df["ratio_mid"] > df["ratio_mid_sma"]) & (df["ratio_roc13"] > 0) & df["mid_live"]
+
+    # S3 / S4 unchanged
+    s3 = df["gold"] > df["gold_sma"]
+    s4 = df["eg_roc"] < -0.05
+
+    # S5: gilt trending — use ETF if live, else always prefer gilt over cash
+    s5_gilt = df["bond_live"] & (df["bond"] > df["bond_sma13"])
+    s5_gilt = s5_gilt | ~df["bond_live"]   # synthetic: always choose gilt over cash
+
+    raw = pd.Series(np.nan, index=df.index, dtype=object)
+    raw[eq_regime  &  s2_mid]                     = "MID"
+    raw[eq_regime  & ~s2_mid]                     = "NIFTY"
+    raw[def_regime &  s3 & s4]                    = "GOLD"
+    raw[def_regime & ~(s3 & s4) &  s5_gilt]       = "GILT"
+    raw[def_regime & ~(s3 & s4) & ~s5_gilt]       = "CASH"
+
+    df["signal"] = raw.ffill().fillna("CASH")
+
+    # ── Returns ──────────────────────────────────────────────────────────────
+    df["nifty_ret"] = df["nifty"].pct_change()
+    df["mid_ret"]   = df["mid"].pct_change()
+    df["gold_ret"]  = df["gold"].pct_change()
+    df["bond_ret"]  = df["bond"].pct_change() if has_bond else BOND_WEEKLY_SYNTH
+    # Where bond ETF is not yet live, fall back to synthetic
+    if has_bond:
+        df["bond_ret"] = df["bond_ret"].fillna(BOND_WEEKLY_SYNTH)
+
+    df["active_pos"] = df["signal"].shift(1)
+    df = df.iloc[1:].copy()
+
+    df["strat_ret"] = np.select(
+        [df["active_pos"] == "MID",
+         df["active_pos"] == "NIFTY",
+         df["active_pos"] == "GOLD",
+         df["active_pos"] == "GILT"],
+        [df["mid_ret"], df["nifty_ret"], df["gold_ret"], df["bond_ret"]],
+        default=CASH_WEEKLY,
+    )
+    return df
+
+
 # ── Metrics ────────────────────────────────────────────────────────────────────
 def compute_metrics(ret: pd.Series, label: str) -> dict:
     r = ret.dropna()
@@ -395,31 +519,31 @@ with st.spinner("Running backtests…"):
     try:
         df4 = run_4signal(raw)
     except Exception as e:
-        st.error(f"4-Signal error: {e}")
-        st.exception(e)
-        st.stop()
+        st.error(f"4-Signal error: {e}"); st.exception(e); st.stop()
     try:
         dfD = run_donchian(raw)
     except Exception as e:
-        st.error(f"Donchian error: {e}")
-        st.exception(e)
-        st.stop()
+        st.error(f"Donchian error: {e}"); st.exception(e); st.stop()
+    try:
+        dfE = run_enhanced(raw)
+    except Exception as e:
+        st.error(f"Enhanced error: {e}"); st.exception(e); st.stop()
 
 # Guard against empty strategy output
-for label, frame in [("4-Signal", df4), ("Donchian", dfD)]:
+for label, frame in [("4-Signal", df4), ("Donchian", dfD), ("Enhanced", dfE)]:
     if frame.empty or "strat_ret" not in frame.columns:
         st.error(f"{label} strategy returned no usable data.")
         st.write(f"Shape: {frame.shape} | Columns: {list(frame.columns)}")
         if not frame.empty:
-            st.write("Head:", frame.head(3))
             st.write("Null counts:", frame.isnull().sum())
         st.stop()
 
 # Align on common period
-common_start = max(df4.index[0], dfD.index[0])
-common_end   = min(df4.index[-1], dfD.index[-1])
+common_start = max(df4.index[0], dfD.index[0], dfE.index[0])
+common_end   = min(df4.index[-1], dfD.index[-1], dfE.index[-1])
 df4 = df4[(df4.index >= common_start) & (df4.index <= common_end)]
 dfD = dfD[(dfD.index >= common_start) & (dfD.index <= common_end)]
+dfE = dfE[(dfE.index >= common_start) & (dfE.index <= common_end)]
 
 # Benchmarks
 nb_ret   = raw["NIFTYBEES"].pct_change().dropna()
@@ -429,6 +553,7 @@ gld_ret  = gld_ret[(gld_ret.index >= common_start) & (gld_ret.index <= common_en
 
 m4   = compute_metrics(df4["strat_ret"], "4-Signal App")
 mD   = compute_metrics(dfD["strat_ret"], "Kiru Donchian")
+mE   = compute_metrics(dfE["strat_ret"], "Enhanced 5-Signal")
 mNB  = compute_metrics(nb_ret,           "Nifty B&H")
 mGLD = compute_metrics(gld_ret,          "Gold B&H")
 
@@ -446,7 +571,7 @@ st.markdown(f"""
 # ── Summary Table ──────────────────────────────────────────────────────────────
 st.markdown('<div class="section-title">📊 Summary Metrics</div>', unsafe_allow_html=True)
 
-all_metrics = [m4, mD, mNB, mGLD]
+all_metrics = [m4, mD, mE, mNB, mGLD]
 best_cagr   = max(m["cagr"] for m in all_metrics)
 best_dd     = max(m["max_dd"] for m in all_metrics)  # least negative = best
 best_sharpe = max(m["sharpe"] for m in all_metrics)
@@ -499,14 +624,16 @@ st.markdown('<div class="section-title">📅 Year-by-Year Returns</div>', unsafe
 
 y4   = yearly_table(df4["strat_ret"])
 yD   = yearly_table(dfD["strat_ret"])
+yE   = yearly_table(dfE["strat_ret"])
 yNB  = yearly_table(nb_ret)
 yGLD = yearly_table(gld_ret)
 
 yearly_df = pd.DataFrame({
-    "4-Signal App":  y4,
-    "Kiru Donchian": yD,
-    "Nifty B&H":     yNB,
-    "Gold B&H":      yGLD,
+    "4-Signal App":      y4,
+    "Kiru Donchian":     yD,
+    "Enhanced 5-Signal": yE,
+    "Nifty B&H":         yNB,
+    "Gold B&H":          yGLD,
 }).dropna(how="all")
 
 # Format with color
@@ -524,10 +651,11 @@ st.dataframe(styled, use_container_width=True)
 st.markdown('<div class="section-title">📈 Growth of ₹1,00,000</div>', unsafe_allow_html=True)
 
 eq_df = pd.DataFrame({
-    "4-Signal App":  m4["equity"],
-    "Kiru Donchian": mD["equity"],
-    "Nifty B&H":     mNB["equity"],
-    "Gold B&H":      mGLD["equity"],
+    "4-Signal App":      m4["equity"],
+    "Kiru Donchian":     mD["equity"],
+    "Enhanced 5-Signal": mE["equity"],
+    "Nifty B&H":         mNB["equity"],
+    "Gold B&H":          mGLD["equity"],
 }).dropna()
 
 st.line_chart(eq_df, use_container_width=True)
@@ -553,50 +681,47 @@ st.markdown('<div class="section-title">📦 Time Spent in Each Asset</div>', un
 
 pos4_counts = df4["active_pos"].value_counts(normalize=True).mul(100).round(1)
 posD_counts = dfD["active_pos"].value_counts(normalize=True).mul(100).round(1)
+posE_counts = dfE["active_pos"].value_counts(normalize=True).mul(100).round(1)
 
-pc1, pc2 = st.columns(2)
+pc1, pc2, pc3 = st.columns(3)
+asset_colors = {"MID": "#FF8C00", "NIFTY": "#1E90FF", "GOLD": "#DAA520",
+                "GILT": "#9B59B6", "CASH": "#3CB371"}
+
+def pos_bars(counts):
+    for asset, pct in counts.items():
+        clr   = asset_colors.get(asset, "#888")
+        bar_w = int(pct)
+        st.markdown(f"""
+        <div style="margin-bottom:8px">
+            <div style="font-size:13px;font-family:'Space Mono',monospace;margin-bottom:3px">
+                <span style="color:{clr};font-weight:700">{asset}</span>
+                <span style="float:right;color:#888">{pct:.1f}%</span>
+            </div>
+            <div style="background:#222;border-radius:4px;height:8px;overflow:hidden">
+                <div style="background:{clr};width:{bar_w}%;height:100%"></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
 with pc1:
     st.markdown("**4-Signal App**")
-    asset_colors = {"MID": "#FF8C00", "NIFTY": "#1E90FF", "GOLD": "#DAA520", "CASH": "#3CB371"}
-    for asset, pct in pos4_counts.items():
-        clr = asset_colors.get(asset, "#888")
-        bar_w = int(pct)
-        st.markdown(f"""
-        <div style="margin-bottom:8px">
-            <div style="font-size:13px;font-family:'Space Mono',monospace;margin-bottom:3px">
-                <span style="color:{clr};font-weight:700">{asset}</span>
-                <span style="float:right;color:#888">{pct:.1f}%</span>
-            </div>
-            <div style="background:#222;border-radius:4px;height:8px;overflow:hidden">
-                <div style="background:{clr};width:{bar_w}%;height:100%"></div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
+    pos_bars(pos4_counts)
 with pc2:
     st.markdown("**Kiru Donchian**")
-    for asset, pct in posD_counts.items():
-        clr = asset_colors.get(asset, "#888")
-        bar_w = int(pct)
-        st.markdown(f"""
-        <div style="margin-bottom:8px">
-            <div style="font-size:13px;font-family:'Space Mono',monospace;margin-bottom:3px">
-                <span style="color:{clr};font-weight:700">{asset}</span>
-                <span style="float:right;color:#888">{pct:.1f}%</span>
-            </div>
-            <div style="background:#222;border-radius:4px;height:8px;overflow:hidden">
-                <div style="background:{clr};width:{bar_w}%;height:100%"></div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+    pos_bars(posD_counts)
+with pc3:
+    st.markdown("**Enhanced 5-Signal**")
+    pos_bars(posE_counts)
 
 # Number of switches
 n_switches_4 = (df4["signal"] != df4["signal"].shift(1)).sum()
 n_switches_D = (dfD["signal"] != dfD["signal"].shift(1)).sum()
+n_switches_E = (dfE["signal"] != dfE["signal"].shift(1)).sum()
 
 st.markdown(f"""
 <div style="font-size:13px;color:#666;font-family:'Space Mono',monospace;margin-top:8px">
   Switches — 4-Signal: {n_switches_4} &nbsp;|&nbsp; Donchian: {n_switches_D}
+  &nbsp;|&nbsp; Enhanced: {n_switches_E}
   &nbsp;&nbsp;(fewer = lower transaction cost)
 </div>
 """, unsafe_allow_html=True)
