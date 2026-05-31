@@ -20,15 +20,14 @@ st.set_page_config(
     layout="centered",
 )
 
-# ── Market Selection (sidebar) ────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### ⚙️ Settings")
-    MARKET = st.radio(
-        "Market",
-        ["🇮🇳 India (NSE)", "🇺🇸 US (NYSE)"],
-        index=0,
-        help="Same strategy rules applied to a different market — out-of-sample validation",
-    )
+# ── Market Selection (top of page — mobile friendly) ──────────────────────────
+MARKET = st.radio(
+    "Select Market",
+    ["🇮🇳 India (NSE)", "🇺🇸 US (NYSE)"],
+    index=0,
+    horizontal=True,
+    help="Same strategy rules applied unchanged — out-of-sample validation",
+)
 IS_US = "US" in MARKET
 
 # ── Constants (India defaults) ────────────────────────────────────────────────
@@ -36,7 +35,7 @@ TICKERS = {
     "NIFTYBEES":  "NIFTYBEES.NS",
     "MID150BEES": "MID150BEES.NS",
     "GOLDBEES":   "GOLDBEES.NS",
-    "BONDBEES":   "GSEC10YBEES.NS",
+    # BONDBEES removed — ETF unavailable; strategies use synthetic 8% p.a. fallback
 }
 SMA_PERIOD        = 26
 SMA_FAST          = 13
@@ -56,10 +55,10 @@ CURRENCY          = "₹"
 # US market overrides — key names identical so all strategy functions unchanged
 if IS_US:
     TICKERS = {
-        "NIFTYBEES":  "SPY",   # S&P 500 ETF  → largecap equity
+        "NIFTYBEES":  "SPY",   # S&P 500 ETF → largecap equity
         "MID150BEES": "MDY",   # S&P MidCap 400 ETF → midcap
         "GOLDBEES":   "GLD",   # SPDR Gold Shares → gold
-        "BONDBEES":   "TLT",   # iShares 20Y Treasury → bond
+        # TLT not added — strategies use synthetic 4% fallback for US bond
     }
     START_DATE        = "2005-01-01"   # GLD launched Nov 2004
     RISK_FREE_RATE    = 0.03
