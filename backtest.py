@@ -20,25 +20,54 @@ st.set_page_config(
     layout="centered",
 )
 
+# ── Market Selection (sidebar) ────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    MARKET = st.radio(
+        "Market",
+        ["🇮🇳 India (NSE)", "🇺🇸 US (NYSE)"],
+        index=0,
+        help="Same strategy rules applied to a different market — out-of-sample validation",
+    )
+IS_US = "US" in MARKET
+
+# ── Constants (India defaults) ────────────────────────────────────────────────
 TICKERS = {
     "NIFTYBEES":  "NIFTYBEES.NS",
     "MID150BEES": "MID150BEES.NS",
     "GOLDBEES":   "GOLDBEES.NS",
-    "BONDBEES":   "GSEC10YBEES.NS",   # SBI ETF 10Y Gilt — S5 bond signal
+    "BONDBEES":   "GSEC10YBEES.NS",
 }
 SMA_PERIOD        = 26
-SMA_FAST          = 13     # Enhanced dual-SMA fast period
+SMA_FAST          = 13
 BUFFER            = 0.02
 ROC_PERIOD        = 26
 DONCHIAN_PERIOD   = 20
-DONCHIAN_FAST     = 13   # Asymmetric: fast entry channel
-DONCHIAN_SLOW     = 26   # Asymmetric: slow exit channel
-RISK_FREE_RATE    = 0.065   # 6.5% p.a. liquid fund
-BOND_RATE         = 0.08    # 8% p.a. synthetic gilt return (fallback)
+DONCHIAN_FAST     = 13
+DONCHIAN_SLOW     = 26
+RISK_FREE_RATE    = 0.065
+BOND_RATE         = 0.08
 CASH_WEEKLY       = RISK_FREE_RATE / 52
 BOND_WEEKLY_SYNTH = BOND_RATE / 52
 START_DATE        = "2010-01-01"
 INITIAL_CAPITAL   = 100_000
+CURRENCY          = "₹"
+
+# US market overrides — key names identical so all strategy functions unchanged
+if IS_US:
+    TICKERS = {
+        "NIFTYBEES":  "SPY",   # S&P 500 ETF  → largecap equity
+        "MID150BEES": "MDY",   # S&P MidCap 400 ETF → midcap
+        "GOLDBEES":   "GLD",   # SPDR Gold Shares → gold
+        "BONDBEES":   "TLT",   # iShares 20Y Treasury → bond
+    }
+    START_DATE        = "2005-01-01"   # GLD launched Nov 2004
+    RISK_FREE_RATE    = 0.03
+    BOND_RATE         = 0.04
+    CASH_WEEKLY       = RISK_FREE_RATE / 52
+    BOND_WEEKLY_SYNTH = BOND_RATE / 52
+    INITIAL_CAPITAL   = 10_000
+    CURRENCY          = "$"
 
 
 # ── Styles ─────────────────────────────────────────────────────────────────────
@@ -181,11 +210,13 @@ def fetch_all():
         except Exception as exc:
             errors.append(f"{name}: {exc}")
 
-    # ── Splice MID150BEES back in time using midcap index ───────────────────────
-    if "MID150BEES" in results:
+    # ── Splice midcap back in time (India only — US MDY has 20yr history) ────────
+    if not IS_US and "MID150BEES" in results:
         spliced, splice_note = build_spliced_mid(results["MID150BEES"])
         results["MID150BEES"] = spliced
         results["_splice_note"] = splice_note
+    elif IS_US:
+        results["_splice_note"] = None   # no splice needed for US
     else:
         results["_splice_note"] = "MID150BEES not fetched — using NIFTY for equity regime"
 
@@ -797,11 +828,12 @@ def color_pct(val):
 
 
 # ── Main App ───────────────────────────────────────────────────────────────────
-st.markdown("""
+_mkt = "SPY · MDY · GLD (US)" if IS_US else "NiftyBees · MID150BEES · GoldBees (India)"
+st.markdown(f"""
 <div style="padding:8px 0 4px 0">
   <span style="font-size:24px;font-weight:800;letter-spacing:-0.5px">📈 Backtest Analysis</span><br>
   <span style="font-size:13px;color:#555;font-family:'Space Mono',monospace">
-    4-Signal App &nbsp;vs&nbsp; Kiru Donchian &nbsp;|&nbsp; Weekly · Yahoo Finance · No look-ahead bias
+    {_mkt} &nbsp;|&nbsp; Weekly · Yahoo Finance · No look-ahead bias
   </span>
 </div>
 """, unsafe_allow_html=True)
@@ -818,7 +850,7 @@ if errors:
 
 # Show splice info
 splice_note = raw.pop("_splice_note", None)
-if splice_note:
+if splice_note and not IS_US:
     st.info(f"📊 Midcap proxy: {splice_note}")
 
 missing = [k for k in ["NIFTYBEES", "GOLDBEES"] if k not in raw]
@@ -896,8 +928,8 @@ end_yr   = pd.to_datetime(common_end).year
 
 st.markdown(f"""
 <div style="font-size:12px;color:#555;font-family:'Space Mono',monospace;margin:8px 0 16px 0">
-  Backtest period: {start_yr}–{end_yr} &nbsp;·&nbsp; {len(df4)} weeks &nbsp;·&nbsp; 
-  Risk-free: {RISK_FREE_RATE*100:.1f}% p.a.
+  Backtest period: {start_yr}–{end_yr} &nbsp;·&nbsp; {len(df4)} weeks &nbsp;·&nbsp;
+  Risk-free: {RISK_FREE_RATE*100:.1f}% p.a. &nbsp;·&nbsp; {'US: SPY/MDY/GLD' if IS_US else 'India: NSE ETFs'}
 </div>
 """, unsafe_allow_html=True)
 
@@ -988,7 +1020,7 @@ st.dataframe(styled, use_container_width=True)
 
 
 # ── Equity Curve ──────────────────────────────────────────────────────────────
-st.markdown('<div class="section-title">📈 Growth of ₹1,00,000</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="section-title">📈 Growth of {CURRENCY}{INITIAL_CAPITAL:,}</div>', unsafe_allow_html=True)
 
 eq_df = pd.DataFrame({
     "4-Signal App":      m4["equity"],
@@ -1013,7 +1045,7 @@ for i, m in enumerate(all_metrics):
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-label">{m['label']}</div>
-            <div class="metric-value" style="font-size:20px">₹{final_val:,.0f}</div>
+            <div class="metric-value" style="font-size:20px">{CURRENCY}{final_val:,.0f}</div>
             <div style="font-size:13px;color:#888;font-family:'Space Mono',monospace;margin-top:4px">{multiple:.1f}x</div>
         </div>
         """, unsafe_allow_html=True)
