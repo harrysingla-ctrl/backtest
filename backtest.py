@@ -90,8 +90,12 @@ def fetch_all():
             # Remove any duplicate dates (safety)
             closes = closes[~closes.index.duplicated(keep="last")]
 
+            # Resample to common weekly anchor (Friday) so all tickers align
+            closes = closes.resample("W-FRI").last()
+
             # Trim to START_DATE
             closes = closes[closes.index >= pd.Timestamp(START_DATE)]
+            closes = closes.dropna()
 
             if len(closes) < SMA_PERIOD + 10:
                 errors.append(f"{name}: only {len(closes)} weeks after {START_DATE} — need >{SMA_PERIOD + 10}")
