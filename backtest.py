@@ -172,15 +172,17 @@ def fetch_all():
             else:
                 results[name] = closes
 
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+
     # ── Splice MID150BEES back in time using midcap index ───────────────────────
     if "MID150BEES" in results:
         spliced, splice_note = build_spliced_mid(results["MID150BEES"])
         results["MID150BEES"] = spliced
-        results["_splice_note"] = splice_note  # pass note to UI
+        results["_splice_note"] = splice_note
     else:
         results["_splice_note"] = "MID150BEES not fetched — using NIFTY for equity regime"
-        except Exception as exc:
-            errors.append(f"{name}: {exc}")
+
     return results, errors
 
 
