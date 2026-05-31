@@ -115,13 +115,16 @@ def run_4signal(data: dict) -> pd.DataFrame:
     nb   = data["NIFTYBEES"]
     gold = data["GOLDBEES"]
 
-    frames = {"nifty": nb, "gold": gold}
+    # Inner join so only dates where ALL tickers have data are kept
     if "MID150BEES" in data:
-        frames["mid"] = data["MID150BEES"]
-    df = pd.DataFrame(frames)
-    df = df[df.index.notna()].copy()
-    if "mid" not in df.columns:
-        df["mid"] = df["nifty"]  # fallback
+        df = pd.concat(
+            [nb.rename("nifty"), data["MID150BEES"].rename("mid"), gold.rename("gold")],
+            axis=1, join="inner",
+        )
+    else:
+        df = pd.concat([nb.rename("nifty"), gold.rename("gold")], axis=1, join="inner")
+        df["mid"] = df["nifty"]   # fallback: no midcap allocation
+    df = df.dropna()
 
     # ── Indicators ──────────────────────────────────────────────────────────
     df["nifty_sma"]     = df["nifty"].rolling(SMA_PERIOD, min_periods=SMA_PERIOD).mean()
@@ -131,15 +134,8 @@ def run_4signal(data: dict) -> pd.DataFrame:
     eg                  = df["nifty"] / df["gold"]
     df["eg_roc"]        = eg.pct_change(ROC_PERIOD)        # fraction, not %
 
-    # Debug: show state before dropna
-    st.write("📍 Before warmup dropna — shape:", df.shape)
-    st.write("Null counts:", df[["nifty_sma","ratio_mid_sma","gold_sma","eg_roc"]].isnull().sum().to_dict())
-    st.write("Sample index (first 3):", list(df.index[:3]))
-    st.write("Nifty sample:", df["nifty"].dropna().head(3).to_dict())
-
     # Drop warmup rows (first SMA_PERIOD + ROC_PERIOD weeks)
     df = df.dropna(subset=["nifty_sma", "ratio_mid_sma", "gold_sma", "eg_roc"]).copy()
-    st.write("📍 After warmup dropna — shape:", df.shape)
     if df.empty:
         return df
 
@@ -194,8 +190,7 @@ def run_donchian(data: dict) -> pd.DataFrame:
     nb   = data["NIFTYBEES"]
     gold = data["GOLDBEES"]
 
-    df = pd.DataFrame({"nifty": nb, "gold": gold})
-    df = df[df.index.notna()].copy()
+    df = pd.concat([nb.rename("nifty"), gold.rename("gold")], axis=1, join="inner").dropna()
 
     df["ratio"]    = df["nifty"] / df["gold"]
 
