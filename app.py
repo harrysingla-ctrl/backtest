@@ -74,7 +74,8 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
 # ── Data Fetch ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_weekly(tickers: dict, weeks: int):
+def fetch_weekly(tickers: tuple, weeks: int):
+    tickers = dict(tickers)   # passed as tuple for cache-busting; convert back here
     end   = datetime.today()
     start = end - timedelta(weeks=weeks)
     out, errors = {}, []
